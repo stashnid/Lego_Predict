@@ -10,12 +10,12 @@ No interpolation, no imputation, no filtering of outliers here - cleaning is
 done and documented in the analysis notebook.
 
 Columns added:
-  pl_rrp            PLN retail price: new scrape (by label) if found, else old value
-                    if it was a plain number, else empty
+  pl_rrp            PLN catalog price ("Cena katalogowa" on promoklocki) from the new scrape,
+                    else the old value if it was a plain number, else empty
   pk_months         number of months with at least one offer
   pk_first_month, pk_last_month
-  pk_last_price     mean of daily lowest offers in the last observed month (PLN)
-  pk_price_y1/y2/y3 mean price in the calendar month exactly 1/2/3 years after
+  pk_last_price     lowest offer (new set) in the last observed month, PLN
+  pk_price_y1/y2/y3 lowest offer in the calendar month exactly 1/2/3 years after
                     retirement (empty if no offers in that month)
   growth_pk         pk_last_price / pl_rrp
   bl_avg_new        BrickLink average sold price, new, last 6 months (EUR, incl. VAT)
@@ -35,19 +35,24 @@ KEEP = ["set_no", "number", "numberVariant", "name", "year", "theme", "themeGrou
 
 
 def promoklocki_features(sets):
-    daily_f, status_f = OUT / "promoklocki_daily.csv", OUT / "promoklocki_status.csv"
-    if not daily_f.exists():
-        print("promoklocki_daily.csv not found - skipping promoklocki columns")
+    hist_f, status_f = OUT / "promoklocki_history.csv", OUT / "promoklocki_status.csv"
+    if not hist_f.exists():
+        print("promoklocki_history.csv not found - skipping promoklocki columns")
         return pd.DataFrame(columns=["url_all_history"])
-    daily = pd.read_csv(daily_f, parse_dates=["date"]).drop_duplicates(["url", "date"])
-    daily["month"] = daily["date"].dt.to_period("M")
-    monthly = daily.groupby(["url", "month"])["price_pln"].mean().rename("price").reset_index()
+    h = pd.read_csv(hist_f, parse_dates=["period_start"]).drop_duplicates(
+        ["url", "period_type", "period_start"])
+    h["month"] = h["period_start"].dt.to_period("M")
+    # The site gives the LOWEST offer per month (until Oct 2025) and per week (from Nov 2025).
+    # To keep one definition, a month = the lowest of its weekly lows (week assigned by start date).
+    monthly = h.groupby(["url", "month"]).agg(price=("lowest_price_pln", "min"),
+                                              catalog=("catalog_price_pln", "last")).reset_index()
 
     feats = monthly.sort_values("month").groupby("url").agg(
         pk_months=("price", "size"),
         pk_first_month=("month", "first"),
         pk_last_month=("month", "last"),
         pk_last_price=("price", "last"),
+        pk_catalog_last=("catalog", "last"),
     )
     # price exactly k years after retirement (same calendar month), observed values only
     ret = sets.dropna(subset=["retired_date"]).drop_duplicates("url_all_history") \
@@ -56,14 +61,16 @@ def promoklocki_features(sets):
     for k in (1, 2, 3):
         vals = {}
         for url, d in ret.items():
-            key = (url, (d + pd.DateOffset(years=k)).to_period("M"))
-            vals[url] = lookup.get(key)
+            vals[url] = lookup.get((url, (d + pd.DateOffset(years=k)).to_period("M")))
         feats[f"pk_price_y{k}"] = pd.Series(vals)
 
     if status_f.exists():
         st = pd.read_csv(status_f).drop_duplicates("url", keep="last").set_index("url")
         feats = feats.join(st[["pl_rrp", "result"]].rename(
             columns={"pl_rrp": "pl_rrp_new", "result": "pk_result"}), how="outer")
+    if "pl_rrp_new" in feats:   # fact box first, catalog column of the table as a fallback
+        feats["pl_rrp_new"] = pd.to_numeric(feats["pl_rrp_new"], errors="coerce") \
+                                .fillna(feats["pk_catalog_last"])
     return feats.rename_axis("url_all_history").reset_index()
 
 
