@@ -1,15 +1,22 @@
 """Re-download the REAL price history from promoklocki.pl up to today.
 
+What the price is (checked on the site, November 2026): for each month (until
+Oct 2025) and each week (from Nov 2025) the page lists "Najniższa cena" = the
+LOWEST offer for a NEW set among the shops promoklocki tracks (LEGO.com, Allegro,
+Empik Marketplace, Klockowo, foreign shops such as Rozetka ...). Amazon prices and
+offers that need a discount code are excluded by the site. It is a price at which
+the set could be BOUGHT, not a sale price.
+
 For every set that has a promoklocki URL in the original data, the script opens
-the set's price-history page and saves every (date, price) point that the page's
-chart contains. Nothing is interpolated or estimated:
-  * a day without offers (null on the chart) is simply not saved,
-  * a page that cannot be parsed is logged as 'parse_failed', not filled in.
+the history page and saves every row of that table. Nothing is interpolated:
+  * a period without offers (empty price) is not saved,
+  * a page without the history table is logged as 'parse_failed'.
 
 Outputs (in update_2026/data/):
-  promoklocki_daily.csv   url, set_no, date, price_pln       (raw chart points)
-  promoklocki_status.csv  one line per page: http status, number of points,
-                          first/last date, retail price found, scrape time (UTC)
+  promoklocki_history.csv  url, set_no, period_type (month/week), period_start,
+                           lowest_price_pln, catalog_price_pln
+  promoklocki_status.csv   one line per page: http status, number of rows,
+                           first/last period, catalog price, scrape time (UTC)
 
 The script is resumable: pages already listed in promoklocki_status.csv are
 skipped, so you can stop it (Ctrl+C) and start again.
@@ -33,7 +40,7 @@ from bs4 import BeautifulSoup
 
 from common import OUT, load_sets
 
-DAILY = OUT / "promoklocki_daily.csv"
+DAILY = OUT / "promoklocki_history.csv"
 STATUS = OUT / "promoklocki_status.csv"
 STATUS_COLS = ["url", "set_no", "http_status", "result", "n_points", "first_date",
                "last_date", "pl_rrp_label", "pl_rrp", "scraped_at_utc"]
@@ -42,55 +49,77 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (student statistics project, UCU)",
     "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.5",
 }
-DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
-NUM_RE = re.compile(r"(\d+(?:[.,]\d+)?)")
-# Labels that promoklocki may use for the official LEGO price. Checked in the test run.
-RRP_LABELS = ("cena katalogowa", "cena sugerowana", "cena regularna", "cena producenta")
+POLISH_MONTHS = {
+    "stycz": 1, "lut": 2, "mar": 3, "kwie": 4, "maj": 5, "czerw": 6,
+    "lip": 7, "sierp": 8, "wrze": 9, "październik": 10, "paźdz": 10, "listopad": 11,
+    "grud": 12,
+}
+PRICE_RE = re.compile(r"(\d[\d\s\xa0]*,\d{2})\s*zł")
+
+
+def _month_no(word):
+    word = word.lower()
+    for stem, n in POLISH_MONTHS.items():
+        if word.startswith(stem):
+            return n
+    return None
+
+
+def _price(text):
+    m = PRICE_RE.search(text or "")
+    return float(re.sub(r"[\s\xa0]", "", m.group(1)).replace(",", ".")) if m else None
+
+
+def parse_period(label):
+    """'marzec 2020' -> ('month', 2020-03-01); 'tydzień od 7 listopada 2026' -> ('week', 2026-11-07)."""
+    label = label.strip().lower()
+    m = re.match(r"tydzień od (\d{1,2}) (\S+) (\d{4})", label)
+    if m:
+        mon = _month_no(m.group(2))
+        return ("week", f"{m.group(3)}-{mon:02d}-{int(m.group(1)):02d}") if mon else (None, None)
+    m = re.match(r"(\S+) (\d{4})$", label)
+    if m:
+        mon = _month_no(m.group(1))
+        return ("month", f"{m.group(2)}-{mon:02d}-01") if mon else (None, None)
+    return None, None
 
 
 def parse_history(html):
-    """Return [(YYYY-MM-DD, price)] from the Google Charts `data.addRow(...)` calls.
+    """Full price history from the table 'Data | Najniższa cena | Najniższa w historii | Cena katalogowa'.
 
-    Same page format the original history_price_add.py relied on:
-      data.addRow([new Date('2023-01-05'), parseFloat(1399.00) ...])   -> a price
-      data.addRow([new Date('2023-01-06'), null])                      -> no offers, skipped
+    Page layout as checked in November 2026: one row per MONTH up to Oct 2025, then one row
+    per WEEK. 'Najniższa cena' = the lowest offer in that month/week across the shops tracked
+    by promoklocki (the site says Amazon prices and offers needing a discount code are excluded).
+    Returns [(period_type, period_start 'YYYY-MM-DD', lowest_price, catalog_price)].
     """
     soup = BeautifulSoup(html, "lxml")
-    points = []
-    for script in soup.find_all("script"):
-        text = script.string or script.get_text() or ""
-        if "data.addRow" not in text:
+    for table in soup.find_all("table"):
+        head = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+        if "najniższa cena" not in head or "cena katalogowa" not in head:
             continue
-        for stmt in text.split(";"):
-            stmt = stmt.strip()
-            if not stmt.startswith("data.addRow"):
+        i_low, i_cat = head.index("najniższa cena"), head.index("cena katalogowa")
+        out = []
+        for tr in table.find_all("tr"):
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+            if len(cells) <= max(i_low, i_cat):
                 continue
-            d = DATE_RE.search(stmt)
-            if not d or "parse" not in stmt:    # [date, null] = no offers that day
-                continue
-            after = stmt.split("parse", 1)[1].replace("'", "").replace('"', "")
-            n = NUM_RE.search(after)
-            if not n:
-                continue
-            price = float(n.group(1).replace(",", "."))
-            if price > 0:
-                points.append((d.group(1), price))
-    return points
+            ptype, start = parse_period(cells[0])
+            low = _price(cells[i_low])
+            if ptype and low:                       # no price = no offers, not saved
+                out.append((ptype, start, low, _price(cells[i_cat])))
+        return out
+    return []
 
 
 def parse_rrp(html):
-    """Find the official retail price by its LABEL (not by cell position)."""
+    """Official LEGO price shown on the page as 'Cena katalogowa' (fact box at the top)."""
     soup = BeautifulSoup(html, "lxml")
-    for cell in soup.find_all(["td", "th", "dt", "span", "div"]):
-        label = cell.get_text(" ", strip=True).lower()
-        if len(label) > 40 or not any(k in label for k in RRP_LABELS):
-            continue
-        nxt = cell.find_next(["td", "dd", "span", "strong", "div"])
-        if nxt is None:
-            continue
-        m = re.search(r"(\d[\d\s]*[.,]\d{2})\s*zł", nxt.get_text(" ", strip=True))
-        if m:
-            return label, float(m.group(1).replace(" ", "").replace("\xa0", "").replace(",", "."))
+    for lab in soup.select(".fact-label"):
+        if "cena katalogowa" in lab.get_text(strip=True).lower():
+            val = lab.find_next_sibling(class_="fact-value") or lab.find_next(class_="fact-value")
+            p = _price(val.get_text(" ", strip=True)) if val else None
+            if p:
+                return "cena katalogowa", p
     return None, None
 
 
@@ -143,7 +172,7 @@ def main():
          open(STATUS, "a", newline="", encoding="utf-8") as fs:
         wd, ws = csv.writer(fd), csv.DictWriter(fs, fieldnames=STATUS_COLS)
         if new_daily:
-            wd.writerow(["url", "set_no", "date", "price_pln"])
+            wd.writerow(["url", "set_no", "period_type", "period_start", "lowest_price_pln", "catalog_price_pln"])
         if new_status:
             ws.writeheader()
 
@@ -156,25 +185,25 @@ def main():
             label, rrp = parse_rrp(html) if code == 200 else (None, None)
             if code != 200:
                 result = "http_error"
-            elif not pts and "data.addRow" not in html:
+            elif not pts and "najniższa cena" not in html.lower():
                 result = "parse_failed"        # page layout changed or no chart at all
             elif not pts:
                 result = "no_offers"
             else:
                 result = "ok"
-            for d, p in pts:
-                wd.writerow([url, set_no, d, p])
+            for row_ in pts:
+                wd.writerow([url, set_no, *row_])
             ws.writerow({
                 "url": url, "set_no": set_no, "http_status": code, "result": result,
-                "n_points": len(pts), "first_date": pts[0][0] if pts else "",
-                "last_date": pts[-1][0] if pts else "", "pl_rrp_label": label or "",
+                "n_points": len(pts), "first_date": pts[0][1] if pts else "",
+                "last_date": pts[-1][1] if pts else "", "pl_rrp_label": label or "",
                 "pl_rrp": rrp if rrp is not None else "",
                 "scraped_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             })
             fd.flush(); fs.flush()
 
             if args.verbose or i % 50 == 0:
-                last = f"{pts[-1][0]} = {pts[-1][1]} zł" if pts else "-"
+                last = f"{pts[-1][1]} = {pts[-1][2]} zł" if pts else "-"
                 print(f"[{i}/{len(todo)}] {set_no:>10} {result:<12} points={len(pts):<5} "
                       f"last={last:<24} rrp={rrp} ({label})")
 
